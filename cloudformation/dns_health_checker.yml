@@ -1,0 +1,225 @@
+#Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+
+#Permission is hereby granted, free of charge, to any person obtaining a copy of this
+#software and associated documentation files (the "Software"), to deal in the Software
+#without restriction, including without limitation the rights to use, copy, modify,
+#merge, publish, distribute, sublicense, and/or sell copies of the Software, and to
+#permit persons to whom the Software is furnished to do so.
+
+#THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED,
+#INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+#PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+#HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+#OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+#SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+AWSTemplateFormatVersion: 2010-09-09
+Description: CloudFormation to launch DNS Resolver.
+Parameters:
+  NameServerEndpoints:
+    Type: String
+    Description: Accelerator GIPs separated by a comma.
+  HcDnsRecord:
+    Type: String
+    Description: DNS record for the DNS Health Check Lambda function to query for.
+  DnsServerName:
+    Type: String
+    Description: Name to be used to reference the server in CloudWatch.
+  DnsQueryTimeout:
+    Type: Number
+    Description: Time for DNS resolver to wait for query response in milliseconds. Min = 500, Max = 25000
+    Default: 10000
+    MinValue: 500
+    MaxValue: 25000
+  CreateRoute53HealthCheck:
+    Type: String
+    Description: Do you want this template to create a Route 53 Health based on the CloudWatch Alarm?
+    Default: true
+    AllowedValues:
+      - true
+      - false
+Conditions:
+  CreateR53Hc: !Equals [!Ref CreateRoute53HealthCheck, true]
+Resources:
+  DnsResolverLambda:
+    Type: "AWS::Lambda::Function"
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt [LambdaExecutionRole, Arn]
+      Description: Lambda DNS Resolver
+      Environment:
+        Variables:
+          HC_DNS_RECORD: !Ref HcDnsRecord
+          DNS_NAME: !Ref DnsServerName
+          NAME_SERVERS: !Ref NameServerEndpoints
+          TIMEOUT_MS: !Ref DnsQueryTimeout
+      Runtime: nodejs12.x
+      Timeout: 60
+      Code:
+        ZipFile: |
+            const HC_DNS_RECORD = process.env.HC_DNS_RECORD;
+            const NAME_SERVERS = process.env.NAME_SERVERS.replace(/\s/g, '').split(',');
+            const DNS_NAME = process.env.DNS_NAME;
+            const TIMEOUT_MS = Number(process.env.TIMEOUT_MS);
+
+            const CloudWatch = require('aws-sdk/clients/cloudwatch');
+            const { Resolver } = require('dns');
+
+            async function resolveName(nameServers, hostname, timeout, callback) {
+              console.log(`Using name servers: '[${nameServers}]'`);
+            
+              var callbackInvoked = false;
+              let invokeCallback = (error, result) => {
+                if (callbackInvoked) {
+                  return;
+                } else {
+                  callbackInvoked = true;
+                  callback(error, result);
+                }
+              };
+
+              setTimeout(() => { invokeCallback(new Error('Timed out'), null); }, timeout);
+              let resolver = new Resolver();
+              resolver.setServers(nameServers);
+            
+              console.log(`Resolving '${hostname}'`);
+              return resolver.resolve(hostname, invokeCallback);
+            }
+
+            function successfulLookup(result) {
+              console.log(`Name server returned '${JSON.stringify(result)}'`);
+              return 0;
+            }
+
+            function failedLookup(error) {
+              console.error(`DNS Lookup Failed: '${error}'`);
+              return 1;
+            }
+
+            function emitMetric(client, dimension, value) {
+              return client.putMetricData({
+                MetricData: [
+                  {
+                    MetricName: 'DnsHealthCheckFailed',
+                    Dimensions: [
+                      {
+                        Name: 'ServerName',
+                        Value: dimension
+                      },
+                    ],
+                    Value: value,
+                  },
+                ],
+                Namespace: 'DnsHealthChecks'
+              }).promise();
+            }
+
+            function successfulMetric(result) {
+              let message = JSON.stringify(result);
+              console.log(`CloudWatch response: '${message}'`);
+              return { statusCode: 200, body: 'Wrote DnsHealthCheck metric' };
+            }
+
+            function failedMetric(error) {
+              let message = JSON.stringify(error);
+              console.error(`CloudWatch error: '${message}'`);
+              return { statusCode: 500, body: `Failed to write to CloudWatch: '${message}'` };
+            }
+
+            async function canResolve(nameServers, hostname, timeout) {
+              return new Promise((resolve, reject) => {
+                resolveName(nameServers, hostname, timeout, (error, result) => {
+                  error ? reject(error) : resolve(result);
+                });
+              });
+            }
+
+            exports.handler = async(event) => {
+              return await canResolve(NAME_SERVERS, HC_DNS_RECORD, TIMEOUT_MS)
+              .then((result) => successfulLookup(result))
+              .catch((error) => failedLookup(error))
+              .then((counter) => {
+                return emitMetric(new CloudWatch(), DNS_NAME, counter)
+                .then((result) => successfulMetric(result))
+                .catch((error) => failedMetric(error));
+              });
+            };   
+  LambdaExecutionRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: "sts:AssumeRole"
+      Policies:
+        - PolicyName: DnsResolverLambda
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource: "arn:aws:logs:*:*:*"
+              - Effect: Allow
+                Action:
+                  - "cloudwatch:PutMetricData"
+                Resource: "*"
+  LambdaEventsRule: 
+    Type: "AWS::Events::Rule"
+    Properties: 
+      Description: Lambda Events Rule
+      ScheduleExpression: "rate(1 minute)"
+      State: ENABLED
+      Targets: 
+        - 
+          Arn: 
+            Fn::GetAtt: 
+              - DnsResolverLambda
+              - Arn
+          Id: DNSResolverV1
+  PermissionForEventsToInvokeLambda: 
+    Type: "AWS::Lambda::Permission"
+    Properties: 
+      FunctionName:
+        Ref: DnsResolverLambda
+      Action: "lambda:InvokeFunction"
+      Principal: events.amazonaws.com
+      SourceArn: 
+        Fn::GetAtt: 
+          - LambdaEventsRule
+          - Arn
+  CloudWatchDnsHcAlarm:
+    Type: "AWS::CloudWatch::Alarm"
+    Properties:
+      MetricName: DnsHealthCheckFailed
+      Namespace: DnsHealthChecks
+      ComparisonOperator: GreaterThanThreshold
+      EvaluationPeriods: 3
+      Period: 60
+      Statistic: Maximum
+      Threshold: 0
+      TreatMissingData: breaching
+      ActionsEnabled: false
+      AlarmDescription: Lambda DNS Health Check Health
+      AlarmName: !Sub "dns_health_check_alarm_${AWS::StackId}"
+      Dimensions:
+        - Name: ServerName
+          Value: !Ref DnsServerName
+      Unit: None
+  Route53HealthCheck:
+    Condition: CreateR53Hc
+    Type: "AWS::Route53::HealthCheck"
+    Properties: 
+      HealthCheckConfig:
+        AlarmIdentifier:
+          Name: !Ref CloudWatchDnsHcAlarm
+          Region: !Ref "AWS::Region"
+        Type: CLOUDWATCH_METRIC
+      HealthCheckTags:
+        - Key: Name
+          Value: !Sub "Hc${CloudWatchDnsHcAlarm}${DnsServerName}"
